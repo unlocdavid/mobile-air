@@ -95,21 +95,38 @@ struct FlexContainer: Layout {
         var childInfos: [ChildInfo] = []
         var flowIndices: [Int] = []
         var absoluteIndices: [Int] = []
-        /// Memoize `finalSize` results by proposal. SwiftUI calls sizeThatFits
-        /// repeatedly with the same proposal during a single layout pass —
-        /// returning the cached size avoids re-walking subviews. We deliberately
-        /// do NOT restore `idealSize` on a cache hit: a previous attempt did
-        /// that and got bitten when Phase 5's `sizeThatFits(.unspecified)` call
-        /// would clobber wrapped heights set by an earlier constrained-cross
-        /// measurement. Returning the cached size leaves whatever idealSize
-        /// the most recent actual measurement set.
-        var sizeCache: [ProposalKey: CGSize] = [:]
+        /// Memoize walks by proposal. SwiftUI calls sizeThatFits repeatedly
+        /// with the same proposal during a single layout pass — returning the
+        /// cached size avoids re-walking subviews. A `sizeThatFits` hit does
+        /// NOT restore `idealSize`: a previous attempt did that and got bitten
+        /// when Phase 5's `sizeThatFits(.unspecified)` call would clobber
+        /// wrapped heights set by an earlier constrained-cross measurement.
+        /// Only `placeSubviews` restores them, from the walk that matches the
+        /// proposal it places for (see `reusableMeasurement`).
+        var sizeCache: [ProposalKey: Measurement] = [:]
         /// The `measurementGeneration` `sizeCache` was filled under.
         var generation = FlexContainer.measurementGeneration
         /// The proposal the children's `idealSize`s were last measured for.
         /// `placeSubviews` reuses those sizes, so it needs to know they match
         /// the proposal it's placing for (see there).
         var measuredKey: ProposalKey?
+    }
+
+    /// One full `sizeThatFits` walk: the size it reported and the
+    /// children's `idealSize`s it left behind.
+    struct Measurement {
+        let size: CGSize
+        let idealSizes: [CGSize]
+        /// The walk's encoded cross-axis proposal — the only input Phase A's
+        /// child measurements depend on.
+        let crossKey: Int64?
+        /// No child grows under a definite main, and Phase B / B2 re-measured
+        /// nothing — so the `idealSize`s are Phase A's alone.
+        let phaseAOnly: Bool
+        let shrinks: Bool
+        /// Phase A's summed main size, gaps included: the threshold below
+        /// which a definite main would trigger Phase B2's shrink.
+        let naturalMain: CGFloat
     }
 
     /// Bumped when the window width changes (rotation, Split View, Stage
@@ -290,7 +307,7 @@ struct FlexContainer: Layout {
         }
         let key = ProposalKey(proposal)
         if let cached = cache.sizeCache[key] {
-            return cached
+            return cached.size
         }
 
         let proposed = CGSize(
@@ -310,10 +327,15 @@ struct FlexContainer: Layout {
         var hypotheticalMains = [Int: CGFloat]()
         var totalGrow: CGFloat = 0
         var totalShrink: CGFloat = 0
+        var growsWhenDefinite = false
+        var remeasured = false
 
         for i in cache.flowIndices {
             let info = cache.childInfos[i]
             let grow = effectiveGrow(info, index: i, finiteMain: proposedMain.isFinite)
+            if effectiveGrow(info, index: i, finiteMain: true) > 0 {
+                growsWhenDefinite = true
+            }
             let crossAvail = proposedCross.isFinite ? proposedCross - crossMargin(info) : nil
             let measureProposal: ProposedViewSize
             if let crossAvail {
@@ -344,6 +366,7 @@ struct FlexContainer: Layout {
 
         let gaps = gap * CGFloat(max(0, cache.flowIndices.count - 1))
         totalMain += gaps
+        let naturalMain = totalMain
 
         // Phase B: when the parent gave us a finite main proposal AND we have
         // flex-grow children, distribute the remaining main space, then RE-
@@ -378,6 +401,7 @@ struct FlexContainer: Layout {
                     }
                     let measured = subviews[i].sizeThatFits(proposal)
                     cache.childInfos[i].idealSize = measured
+                    remeasured = true
                     // maxCross was tracking Phase A measurements — replace this
                     // child's contribution with the new (constrained) one.
                     let newCross = crossSize(measured) + crossMargin(info)
@@ -440,6 +464,7 @@ struct FlexContainer: Layout {
                     }
                     let measured = subviews[i].sizeThatFits(proposal)
                     cache.childInfos[i].idealSize = measured
+                    remeasured = true
                     let newCross = crossSize(measured) + crossMargin(info)
                     if newCross > maxCross {
                         maxCross = newCross
@@ -476,9 +501,38 @@ struct FlexContainer: Layout {
         }
 
         let result = makeSize(main: finalMain, cross: finalCross)
-        cache.sizeCache[key] = result
+        cache.sizeCache[key] = Measurement(
+            size: result,
+            idealSizes: cache.childInfos.map(\.idealSize),
+            crossKey: isRow ? key.height : key.width,
+            phaseAOnly: !growsWhenDefinite && !remeasured,
+            shrinks: totalShrink > 0,
+            naturalMain: naturalMain
+        )
         cache.measuredKey = key
         return result
+    }
+
+    /// A walk whose `idealSize`s are exactly what a fresh walk for `proposal`
+    /// would produce: the walk for that very proposal, or a Phase-A-only walk
+    /// under the same cross proposal when this main would not trigger Phase
+    /// B2 either. Placement proposals are definite on both axes while the
+    /// parent measured with an open main, so the exact key is usually absent
+    /// and the second rule is what spares the re-walk — whose new proposals
+    /// would miss every nested container's memo in turn.
+    private func reusableMeasurement(for proposal: ProposedViewSize, key: ProposalKey, cache: CacheData) -> Measurement? {
+        if let exact = cache.sizeCache[key] {
+            return exact
+        }
+
+        let crossKey = isRow ? key.height : key.width
+        let proposedMain = (isRow ? proposal.width : proposal.height) ?? .infinity
+
+        return cache.sizeCache.values.first { measurement in
+            measurement.crossKey == crossKey
+                && measurement.phaseAOnly
+                && (!measurement.shrinks || !(proposedMain - measurement.naturalMain < 0))
+        }
     }
 
     // MARK: - placeSubviews
@@ -503,8 +557,16 @@ struct FlexContainer: Layout {
         // Re-measure for this proposal (bypassing the memo) when they differ.
         let placementKey = ProposalKey(proposal)
         if cache.measuredKey != placementKey {
-            cache.sizeCache[placementKey] = nil
-            _ = sizeThatFits(proposal: proposal, subviews: subviews, cache: &cache)
+            if cache.generation == Self.measurementGeneration,
+               let measurement = reusableMeasurement(for: proposal, key: placementKey, cache: cache) {
+                for (i, size) in measurement.idealSizes.enumerated() where i < cache.childInfos.count {
+                    cache.childInfos[i].idealSize = size
+                }
+                cache.measuredKey = placementKey
+            } else {
+                cache.sizeCache[placementKey] = nil
+                _ = sizeThatFits(proposal: proposal, subviews: subviews, cache: &cache)
+            }
         }
 
         let containerMain = mainSize(bounds.size)
